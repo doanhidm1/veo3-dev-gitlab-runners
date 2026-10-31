@@ -1,0 +1,66 @@
+name: GitLab Runner Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Dispatch source guard
+        required: true
+        type: string
+      release_tag:
+        description: GitLab release tag
+        required: false
+        type: string
+      pipeline_id:
+        description: GitLab pipeline ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+run-name: "GitLab Runner Windows ${{ github.event.inputs.release_tag || 'manual' }} #${{ github.event.inputs.pipeline_id || 'manual' }}"
+
+concurrency:
+  group: gitlab-runner-windows
+  cancel-in-progress: true
+
+jobs:
+  runner-windows:
+    if: ${{ github.event.inputs.source == 'gitlab-release' && github.event.inputs.pipeline_id != '' }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      GITLAB_URL: ${{ vars.GITLAB_URL }}
+      GITLAB_RUNNER_TOKEN: ${{ secrets.GITLAB_RUNNER_TOKEN_WINDOWS }}
+      LOG_LEVEL: warn
+      RUNNER_DIR: C:\gitlab-runner
+      RUNNER_CONFIG: C:\gitlab-runner\config.toml
+
+    steps:
+      - name: Prepare runner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force $env:RUNNER_DIR | Out-Null
+          & curl.exe -fL --retry 4 --retry-delay 3 --connect-timeout 20 `
+            'https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-windows-amd64.exe' `
+            -o "$env:RUNNER_DIR\gitlab-runner.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download GitLab Runner with exit code $LASTEXITCODE" }
+
+      - name: Register and run one GitLab job
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GITLAB_URL) { throw 'Missing variable GITLAB_URL' }
+          if (-not $env:GITLAB_RUNNER_TOKEN) { throw 'Missing secret GITLAB_RUNNER_TOKEN_WINDOWS' }
+          $runner = "$env:RUNNER_DIR\gitlab-runner.exe"
+          $runnerName = "gh-windows-$env:GITHUB_RUN_ID"
+          & $runner --log-level error register --config $env:RUNNER_CONFIG --non-interactive --url $env:GITLAB_URL --token $env:GITLAB_RUNNER_TOKEN --name $runnerName --executor shell --shell powershell
+          if ($LASTEXITCODE -ne 0) { throw "GitLab Runner registration failed with exit code $LASTEXITCODE" }
+          try {
+            & $runner --log-level error run-single --config $env:RUNNER_CONFIG -r $runnerName --max-builds 1 --wait-timeout 120 *> "$env:RUNNER_DIR\job.log"
+            if ($LASTEXITCODE -ne 0) { throw "GitLab Runner exited with code $LASTEXITCODE" }
+          } finally {
+            & $runner --log-level error unregister --config $env:RUNNER_CONFIG --name $runnerName *> $null
+          }
