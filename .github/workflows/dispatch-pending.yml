@@ -1,0 +1,94 @@
+name: Dispatch GitLab Veo Linux runners
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: gitlab-veo-linux-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      GITLAB_API_URL: https://gitlab.com/api/v4
+      GITLAB_PROJECT_ID: '85971878'
+      GITLAB_READ_TOKEN: ${{ secrets.GITLAB_READ_TOKEN }}
+      RUNNER_TAG: veo3-github-linux
+      RUNNER_WORKFLOW: gitlab-runner-linux.yml
+      MAX_ACTIVE_RUNNERS: '8'
+
+    steps:
+      - name: Dispatch pending jobs
+        run: |
+          set -euo pipefail
+          test -n "$GITLAB_READ_TOKEN"
+
+          pending_json="$RUNNER_TEMP/pending-jobs.json"
+          deadline=$((SECONDS + 240))
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            curl -fsS --retry 3 --retry-delay 2 --max-time 30 \
+              -H "PRIVATE-TOKEN: $GITLAB_READ_TOKEN" \
+              "$GITLAB_API_URL/projects/$GITLAB_PROJECT_ID/jobs?scope%5B%5D=pending&per_page=100" \
+              -o "$pending_json"
+
+            jq -e --arg tag "$RUNNER_TAG" '
+              type == "array" and
+              all(.[]; (.tag_list | type) == "array")
+            ' "$pending_json" >/dev/null
+
+            mapfile -t pending_jobs < <(
+              jq -c --arg tag "$RUNNER_TAG" '
+                .[]
+                | select((.tag_list // []) | index($tag))
+                | select((.pipeline.sha // "") | test("^[0-9a-f]{40,64}$"))
+                | . as $job
+                | {
+                    cache_key: $job.pipeline.sha,
+                    cache_enabled: (
+                      ["secret_detection", "upload-internal-release-r2"]
+                      | index($job.name)
+                      | not
+                    )
+                  }
+              ' "$pending_json"
+            )
+
+            active_count="$(
+              gh run list \
+                --repo "$GH_REPO" \
+                --workflow "$RUNNER_WORKFLOW" \
+                --limit 100 \
+                --json status \
+                --jq '[.[] | select(.status == "queued" or .status == "in_progress")] | length'
+            )"
+            available=$((MAX_ACTIVE_RUNNERS - active_count))
+            if [ "$available" -lt 0 ]; then available=0; fi
+            dispatch_count="${#pending_jobs[@]}"
+            if [ "$dispatch_count" -gt "$available" ]; then dispatch_count=$available; fi
+
+            if [ "$dispatch_count" -gt 0 ]; then
+              echo "Dispatching $dispatch_count Veo runner(s): ${#pending_jobs[@]} pending, $active_count active"
+              for ((i = 0; i < dispatch_count; i++)); do
+                cache_key="$(jq -r '.cache_key' <<<"${pending_jobs[$i]}")"
+                cache_enabled="$(jq -r '.cache_enabled' <<<"${pending_jobs[$i]}")"
+                gh workflow run "$RUNNER_WORKFLOW" \
+                  --repo "$GH_REPO" \
+                  --ref main \
+                  -f "cache_key=$cache_key" \
+                  -f "cache_enabled=$cache_enabled"
+              done
+            fi
+
+            sleep 15
+          done
